@@ -40,6 +40,7 @@ mod randomize;
 mod runtime;
 mod screen;
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,34 +80,6 @@ pub struct ShardXOptions {
     pub progress: Option<ProgressCb>,
 }
 
-/// What to launch: a library id, a ready [`Profile`], or a raw config object.
-pub enum LaunchInput {
-    Id(String),
-    Profile(Profile),
-    Config(Value),
-}
-
-impl From<&str> for LaunchInput {
-    fn from(s: &str) -> Self {
-        LaunchInput::Id(s.to_string())
-    }
-}
-impl From<String> for LaunchInput {
-    fn from(s: String) -> Self {
-        LaunchInput::Id(s)
-    }
-}
-impl From<Profile> for LaunchInput {
-    fn from(p: Profile) -> Self {
-        LaunchInput::Profile(p)
-    }
-}
-impl From<Value> for LaunchInput {
-    fn from(v: Value) -> Self {
-        LaunchInput::Config(v)
-    }
-}
-
 /// Result of [`ShardX::check_proxy`] — the same data the launcher uses to
 /// decide QUIC + WebRTC policy.
 #[derive(Debug, Clone)]
@@ -115,6 +88,11 @@ pub struct ProxyCheckResult {
     pub geo: GeoInfo,
     pub would_enable_quic: bool,
     pub would_set_webrtc: WebRtcMode,
+}
+
+/// Fresh 128-bit hex id for a saved profile (its folder + state key).
+fn new_profile_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 /// Top-level façade — bundles the runtime, fingerprint library, and browser
@@ -161,24 +139,101 @@ impl ShardX {
         self.library.load(id)
     }
 
-    /// Launch a profile.
+    // ---- persistent profiles -------------------------------------------
+    //
+    // A *saved profile* is a frozen, uniquely-id'd copy of a library template
+    // (or a random one) enriched with randomized hardware/platform_version —
+    // the same thing the desktop launcher does on "create profile". It lives
+    // in its own folder `<profiles_root>/<id>/` together with its browser
+    // state, so you can reopen the exact same profile later or delete it.
+
+    /// Create a new persistent profile from a library template (or a random
+    /// template when `template` is `None`), enriched with randomized
+    /// hardware + platform_version under a fresh unique id, and frozen to disk.
+    /// Pass the returned profile straight to `launch` / `session`.
+    pub async fn create_profile(&self, template: Option<&str>) -> Result<Profile> {
+        self.runtime.install(false).await?;
+        let mut config = match template {
+            Some(id) => self.library.load(id)?.config,
+            None => self.random_profile(None).await?.config,
+        };
+        let id = new_profile_id();
+        // Seed hardware by the new id so the pick is stable across reopens.
+        randomize_hardware(&mut config, Some(&id));
+        randomize_platform_version(&mut config);
+        let profile = Profile::new(config, Some(id));
+        self.save_profile(&profile)?;
+        Ok(profile)
+    }
+
+    /// Persist a profile's current config to its on-disk folder. Call this
+    /// after mutating a reopened profile (e.g. `set_noise`) to keep changes.
+    pub fn save_profile(&self, profile: &Profile) -> Result<()> {
+        let path = self.profile_json_path(&profile.id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, serde_json::to_string_pretty(&profile.config)?)?;
+        Ok(())
+    }
+
+    /// Reopen a previously created profile by id (same fingerprint + state).
+    pub fn open_profile(&self, id: &str) -> Result<Profile> {
+        let path = self.profile_json_path(id);
+        if !path.exists() {
+            return Err(anyhow!("saved profile '{id}' not found"));
+        }
+        let config: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        Ok(Profile::new(config, Some(id.to_string())))
+    }
+
+    /// Ids of every saved profile, sorted.
+    pub fn list_saved_profiles(&self) -> Result<Vec<String>> {
+        let root = self.runtime.profiles_root();
+        let mut out = Vec::new();
+        if root.exists() {
+            for entry in fs::read_dir(&root)? {
+                let entry = entry?;
+                if entry.path().join("profile.json").exists() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        out.push(name.to_string());
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Delete a saved profile and all its state (cookies, cache, …).
+    pub fn delete_profile(&self, id: &str) -> Result<()> {
+        let dir = self.runtime.profiles_root().join(id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    fn profile_json_path(&self, id: &str) -> PathBuf {
+        self.runtime.profiles_root().join(id).join("profile.json")
+    }
+
+    /// Launch a `Profile`. Get one from [`ShardX::create_profile`] (the
+    /// recommended path — a persistent profile frozen from a library template
+    /// or a random one), [`Profile::from_file`], or [`Profile::new`] for your
+    /// own config. Library templates are never launched directly — go through
+    /// `create_profile` so each run has a stable identity and the bundled
+    /// fingerprint library stays untouched.
     ///
-    /// `input` is a library id, a [`Profile`], a raw config [`Value`], or
-    /// `None` to pick a random profile (filtered by `opts.platform`).
-    /// `opts.randomize` re-picks hardware_concurrency / device_memory /
-    /// platform_version before launch.
+    /// `opts.randomize` re-rolls hardware_concurrency / device_memory /
+    /// platform_version before launch (off by default; leave it off for a
+    /// saved profile or its frozen fingerprint will drift).
     pub async fn launch(
         &self,
-        input: Option<LaunchInput>,
+        mut profile: Profile,
         opts: LaunchOptions,
     ) -> Result<BrowserSession> {
         self.runtime.install(false).await?;
-        let mut profile = match input {
-            None => self.random_profile(opts.platform.as_deref()).await?,
-            Some(LaunchInput::Id(id)) => self.library.load(&id)?,
-            Some(LaunchInput::Profile(p)) => p,
-            Some(LaunchInput::Config(v)) => Profile::new(v, None),
-        };
         if opts.randomize {
             let id = profile.id.clone();
             randomize_hardware(&mut profile.config, Some(&id));
@@ -196,11 +251,11 @@ impl ShardX {
     #[cfg(feature = "control")]
     pub async fn session(
         &self,
-        input: Option<LaunchInput>,
+        profile: Profile,
         mut opts: LaunchOptions,
     ) -> Result<Session> {
         opts.cdp = true;
-        let engine = self.launch(input, opts).await?;
+        let engine = self.launch(profile, opts).await?;
         if engine.cdp_url.is_none() {
             let mut engine = engine;
             let _ = engine.stop().await;
@@ -217,11 +272,11 @@ impl ShardX {
     /// feature needed).
     pub async fn launch_cdp(
         &self,
-        input: Option<LaunchInput>,
+        profile: Profile,
         mut opts: LaunchOptions,
     ) -> Result<BrowserSession> {
         opts.cdp = true;
-        let mut session = self.launch(input, opts).await?;
+        let mut session = self.launch(profile, opts).await?;
         if session.cdp_url.is_none() {
             let _ = session.stop().await;
             return Err(anyhow!(

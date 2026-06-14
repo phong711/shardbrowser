@@ -67,6 +67,56 @@ impl Profile {
         Profile::new(out, Some(id))
     }
 
+    /// Enable exactly the named noise vectors (with soft defaults) and disable
+    /// the rest. Declarative — re-calling replaces the selection, so a dropped
+    /// vector is turned off. Seeds are derived per-profile at launch. Panics on
+    /// an unknown vector name.
+    ///
+    /// Vectors: `canvas`, `webgl`, `audio`, `client_rects`, `sensors`, `fonts`.
+    ///
+    /// ```ignore
+    /// p.set_noise(&["canvas", "audio"]); // only these two on
+    /// p.set_noise(&["canvas"]);          // audio now off again
+    /// ```
+    pub fn set_noise(&mut self, vectors: &[&str]) -> &mut Self {
+        const NOISE_VECTORS: [&str; 6] =
+            ["canvas", "webgl", "audio", "client_rects", "sensors", "fonts"];
+        for &v in vectors {
+            assert!(NOISE_VECTORS.contains(&v), "unknown noise vector: {v}");
+        }
+        let obj = self
+            .config
+            .as_object_mut()
+            .expect("profile config must be a JSON object");
+        let noise = obj
+            .entry("noise")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("noise must be a JSON object");
+        for v in NOISE_VECTORS {
+            let on = vectors.contains(&v);
+            let block = noise
+                .entry(v)
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("noise vector must be a JSON object");
+            block.insert("enabled".into(), Value::Bool(on));
+            block.entry("seed").or_insert_with(|| Value::from(0));
+            if on {
+                match v {
+                    "webgl" => {
+                        block.entry("intensity").or_insert_with(|| Value::from(0.0005));
+                    }
+                    "client_rects" => {
+                        block.entry("max_offset").or_insert_with(|| Value::from(1));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self
+    }
+
     pub fn platform(&self) -> String {
         self.config
             .get("navigator")

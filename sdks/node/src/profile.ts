@@ -6,6 +6,14 @@ import { join } from "node:path";
 
 import type { Runtime } from "./runtime.js";
 
+const NOISE_VECTORS = ["canvas", "webgl", "audio", "client_rects", "sensors", "fonts"] as const;
+export type NoiseVector = (typeof NOISE_VECTORS)[number];
+// vector -> [soft knob, value applied when the vector is enabled]
+const NOISE_KNOB: Partial<Record<NoiseVector, [string, number]>> = {
+  webgl: ["intensity", 0.0005],
+  client_rects: ["max_offset", 1],
+};
+
 export class Profile {
   readonly id: string;
   config: Record<string, unknown>;
@@ -33,6 +41,39 @@ export class Profile {
       }
     }
     return new Profile(out, (overrides["name"] as string | undefined) ?? this.id);
+  }
+
+  /** Enable exactly the named noise vectors (soft defaults) and disable the
+   *  rest. Declarative — re-calling replaces the selection, so a dropped
+   *  vector is turned off. Seeds are derived per-profile at launch.
+   *
+   *  @example p.setNoise("canvas", "audio")  // only these two on
+   *  @example p.setNoise("canvas")           // audio now off again
+   */
+  setNoise(...vectors: NoiseVector[]): this {
+    for (const v of vectors) {
+      if (!NOISE_VECTORS.includes(v)) {
+        throw new Error(`unknown noise vector: ${v} (valid: ${NOISE_VECTORS.join(", ")})`);
+      }
+    }
+    const on = new Set<string>(vectors);
+    let noise = this.config["noise"] as Record<string, Record<string, unknown>> | undefined;
+    if (!noise || typeof noise !== "object") {
+      noise = {};
+      this.config["noise"] = noise;
+    }
+    for (const v of NOISE_VECTORS) {
+      let block = noise[v];
+      if (!block || typeof block !== "object") {
+        block = {};
+        noise[v] = block;
+      }
+      block["enabled"] = on.has(v);
+      if (block["seed"] === undefined) block["seed"] = 0;
+      const knob = NOISE_KNOB[v];
+      if (on.has(v) && knob && block[knob[0]] === undefined) block[knob[0]] = knob[1];
+    }
+    return this;
   }
 
   get platform(): string {

@@ -26,23 +26,26 @@ CDP browser in one call (the Rust equivalent of patchright in the Python/Node
 SDKs). It's behind the default `control` feature.
 
 ```rust
-use shardx::{ShardX, ShardXOptions, LaunchOptions, LaunchInput};
+use shardx::{ShardX, ShardXOptions, LaunchOptions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let sdk = ShardX::new(ShardXOptions::default())?;
 
-    // List / pick fingerprints (auto-installs the library on first call).
-    let ids = sdk.list_profiles(Some("Windows")).await?;
-    println!("{} Windows profiles", ids.len());
+    // Create a persistent profile from a library template (or None for a
+    // random one): enriches a COPY with randomized hw/platform_version and
+    // freezes it under a unique id — the fingerprint library is read-only and
+    // never launched directly. Do this once per profile.
+    let profile = sdk.create_profile(Some("win-rtx4060")).await?;
 
-    // Launch a specific profile through a proxy and get a driven browser.
+    // Launch it through a proxy and get a driven browser. randomize: false
+    // keeps the frozen fingerprint stable; cookies/cache persist across runs.
     let session = sdk
         .session(
-            Some(LaunchInput::from("win-rtx4060")),
+            profile.clone(),
             LaunchOptions {
                 proxy: Some("socks5://user:pass@host:1080".into()),
-                randomize: true, // re-pick hw_concurrency / device_memory / platform_version
+                randomize: false,
                 ..Default::default()
             },
         )
@@ -63,9 +66,10 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Pass `None` as the first arg to launch a **random** profile (filtered by
-`LaunchOptions::platform`). You can also launch from a raw config:
-`LaunchInput::from(serde_json::json!({ ... }))`.
+Pass `None` to `create_profile` for a **random** template. To launch your own
+fingerprint, build a `Profile` (`Profile::from_file(path)` or
+`Profile::new(serde_json::json!({ ... }), None)`) and hand it to `session` —
+`launch`/`session` only take a `Profile`, never a raw library id.
 
 ### Without a driver (lighter build)
 
@@ -75,10 +79,67 @@ If you don't want the CDP client, disable the feature
 client):
 
 ```rust
-let mut engine = sdk.launch_cdp(None, LaunchOptions::default()).await?;
+let profile = sdk.create_profile(None).await?;
+let mut engine = sdk.launch_cdp(profile, LaunchOptions::default()).await?;
 println!("CDP: {:?}", engine.cdp_url);
 engine.stop().await?;
 ```
+
+## Persistent profiles
+
+`list_profiles()` / random launches hand back **library templates** — launch
+one and it re-reads the same template every time. For a profile you can
+**return to** (same fingerprint *and* cookies/cache) or **delete**, create a
+*saved profile*: it freezes a template (or a random one) with randomized
+hardware/platform_version under a fresh unique id in its own folder
+`<cache>/profiles/<id>/`, exactly like the desktop launcher's "create profile".
+
+```rust
+use shardx::{ShardX, ShardXOptions, LaunchOptions};
+
+let sdk = ShardX::new(ShardXOptions::default())?;
+
+// Create once (random template, or Some("win-rtx4060")).
+let mut profile = sdk.create_profile(None).await?;
+println!("{}", profile.id);
+println!("{:?}", sdk.list_saved_profiles()?);          // ["<id>", ...]
+
+// Launch it — randomize: false keeps the frozen fingerprint stable; cookies /
+// cache persist in the profile's folder across runs.
+let session = sdk.session(
+    profile.clone(),
+    LaunchOptions { randomize: false, ..Default::default() },
+).await?;
+// ... drive it, then session.close().await?; ...
+
+// Later — even another process — reopen by id: same fingerprint + state.
+let profile = sdk.open_profile(&profile.id)?;
+
+// Remove the profile and all its state when you're done.
+sdk.delete_profile(&profile.id)?;
+```
+
+Saved profiles never touch the bundled S3 library: templates stay read-only in
+`<cache>/fingerprints/*.json`, saved profiles live in `<cache>/profiles/<id>/`
+(holding `profile.json` + the browser's user-data-dir).
+
+## Anti-fingerprint noise
+
+Per-vector noise (canvas / WebGL / audio / DOMRect / sensors / fonts) is **off
+by default**. `set_noise(...)` is **declarative** — exactly the vectors you list
+are enabled (with soft defaults), every other one is turned off:
+
+```rust
+profile.set_noise(&["canvas", "audio", "webgl"]); // only these three on
+profile.set_noise(&["canvas"]);                    // audio + webgl now off again
+profile.set_noise(&[]);                            // all off
+sdk.save_profile(&profile)?;                        // persist the choice
+```
+
+Seeds are derived **per-profile** at launch — stable across runs, unique per
+profile — so two profiles with the same vectors enabled still produce different
+canvas/audio/WebGL fingerprints. Soft defaults: WebGL `intensity 0.0005`,
+DOMRect `max_offset 1`.
 
 ## Validate a proxy before binding it
 
